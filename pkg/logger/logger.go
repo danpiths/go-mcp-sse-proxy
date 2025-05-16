@@ -1,17 +1,12 @@
 package logger
 
 import (
-	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"runtime"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 // LogLevel represents different logging levels
@@ -50,15 +45,6 @@ type LogEntry struct {
 	Fields        map[string]interface{} `json:"fields,omitempty"`
 }
 
-// Logger provides structured logging with rotation
-type Logger struct {
-	level      LogLevel
-	output     io.Writer
-	mu         sync.Mutex
-	fields     map[string]interface{}
-	timeFormat string
-}
-
 // LoggerConfig holds configuration for the logger
 type LoggerConfig struct {
 	Level      LogLevel
@@ -85,62 +71,48 @@ var defaultConfig = LoggerConfig{
 	UseFile:    false, // don't output to file by default
 }
 
+// Logger provides structured logging with rotation
+type Logger struct {
+	config *LoggerConfig
+	file   *os.File
+	fields map[string]interface{}
+}
+
 // NewLogger creates a new logger with the specified configuration
 func NewLogger(config *LoggerConfig) *Logger {
 	if config == nil {
 		config = &defaultConfig
 	}
 
-	var writers []io.Writer
-
-	// Add console writer if enabled
-	if config.UseConsole {
-		writers = append(writers, os.Stdout)
+	logger := &Logger{
+		config: config,
+		fields: make(map[string]interface{}),
 	}
 
-	// Add file writer if enabled
-	if config.UseFile && config.Filename != "" {
-		// Create directory if it doesn't exist
+	if config.UseFile {
+		// Create logs directory if it doesn't exist
 		if err := os.MkdirAll(filepath.Dir(config.Filename), 0755); err != nil {
 			fmt.Printf("Error creating log directory: %v\n", err)
 		}
 
-		// Configure log rotation
-		fileWriter := &lumberjack.Logger{
-			Filename:   config.Filename,
-			MaxSize:    config.MaxSize,
-			MaxBackups: config.MaxBackups,
-			MaxAge:     config.MaxAge,
-			Compress:   config.Compress,
+		// Open log file
+		file, err := os.OpenFile(config.Filename, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			fmt.Printf("Error opening log file: %v\n", err)
+		} else {
+			logger.file = file
 		}
-		writers = append(writers, fileWriter)
 	}
 
-	// Create multi-writer if multiple outputs
-	var output io.Writer
-	if len(writers) > 1 {
-		output = io.MultiWriter(writers...)
-	} else if len(writers) == 1 {
-		output = writers[0]
-	} else {
-		output = os.Stdout // fallback to stdout
-	}
-
-	return &Logger{
-		level:      config.Level,
-		output:     output,
-		fields:     make(map[string]interface{}),
-		timeFormat: config.TimeFormat,
-	}
+	return logger
 }
 
 // WithFields creates a new logger with the additional fields
 func (l *Logger) WithFields(fields map[string]interface{}) *Logger {
 	newLogger := &Logger{
-		level:      l.level,
-		output:     l.output,
-		timeFormat: l.timeFormat,
-		fields:     make(map[string]interface{}, len(l.fields)+len(fields)),
+		config: l.config,
+		file:   l.file,
+		fields: make(map[string]interface{}, len(l.fields)+len(fields)),
 	}
 
 	// Copy existing fields
@@ -166,68 +138,70 @@ func (l *Logger) WithCorrelationID(correlationID string) *Logger {
 	})
 }
 
-// SetLogLevel sets the logger's level
-func (l *Logger) SetLogLevel(level LogLevel) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.level = level
-}
-
 // GetLogLevel returns the current log level
 func (l *Logger) GetLogLevel() LogLevel {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.level
+	return l.config.Level
 }
 
-func (l *Logger) log(level LogLevel, format string, v ...interface{}) {
-	if level < l.level {
+// log writes a log message with the given level
+func (l *Logger) log(level LogLevel, format string, args ...interface{}) {
+	if level < l.config.Level {
 		return
 	}
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	// Get caller information
-	_, file, line, ok := runtime.Caller(2)
-	if !ok {
-		file = "unknown"
-		line = 0
+	// Format the message
+	timestamp := time.Now().Format(l.config.TimeFormat)
+	levelStr := ""
+	switch level {
+	case LogDebug:
+		levelStr = "DEBUG"
+	case LogInfo:
+		levelStr = "INFO"
+	case LogWarn:
+		levelStr = "WARN"
+	case LogError:
+		levelStr = "ERROR"
 	}
 
-	// Create log entry
-	entry := LogEntry{
-		Timestamp: time.Now().Format(l.timeFormat),
-		Level:     level.String(),
-		Message:   fmt.Sprintf(format, v...),
-		File:      filepath.Base(file),
-		Line:      line,
-		Fields:    l.fields,
+	message := fmt.Sprintf(format, args...)
+	logLine := fmt.Sprintf("%s [%s] %s\n", timestamp, levelStr, message)
+
+	// Write to console if enabled
+	if l.config.UseConsole {
+		fmt.Print(logLine)
 	}
 
-	// Marshal to JSON
-	jsonData, err := json.Marshal(entry)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error marshaling log entry: %v\n", err)
-		return
+	// Write to file if enabled and file is open
+	if l.config.UseFile && l.file != nil {
+		if _, err := l.file.WriteString(logLine); err != nil {
+			fmt.Printf("Error writing to log file: %v\n", err)
+		}
 	}
-
-	// Write log entry
-	l.output.Write(append(jsonData, '\n'))
 }
 
-func (l *Logger) Debug(format string, v ...interface{}) {
-	l.log(LogDebug, format, v...)
+// Debug logs a debug message
+func (l *Logger) Debug(format string, args ...interface{}) {
+	l.log(LogDebug, format, args...)
 }
 
-func (l *Logger) Info(format string, v ...interface{}) {
-	l.log(LogInfo, format, v...)
+// Info logs an info message
+func (l *Logger) Info(format string, args ...interface{}) {
+	l.log(LogInfo, format, args...)
 }
 
-func (l *Logger) Warn(format string, v ...interface{}) {
-	l.log(LogWarn, format, v...)
+// Warn logs a warning message
+func (l *Logger) Warn(format string, args ...interface{}) {
+	l.log(LogWarn, format, args...)
 }
 
-func (l *Logger) Error(format string, v ...interface{}) {
-	l.log(LogError, format, v...)
+// Error logs an error message
+func (l *Logger) Error(format string, args ...interface{}) {
+	l.log(LogError, format, args...)
+}
+
+// Close closes the logger and its file
+func (l *Logger) Close() {
+	if l.file != nil {
+		l.file.Close()
+	}
 }

@@ -5,6 +5,10 @@
 *.so
 *.dylib
 
+# Project specific binaries
+out
+out-*
+
 # Test binary, built with `go test -c`
 *.test
 
