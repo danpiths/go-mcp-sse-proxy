@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -18,21 +19,24 @@ import (
 	"time"
 )
 
-// GatewayInstance represents a Supergateway subprocess
-// bound to an internal port and proxied under a specific URL prefix.
+// GatewayInstance holds a supergateway subprocess bound to an internal URL.
 type GatewayInstance struct {
 	Cmd         *exec.Cmd
 	InternalURL *url.URL
 }
 
 var (
-	// allowedCommands maps unescaped stdio command strings to their invocation
+	// allowedCommands: unescaped -> actual command invocation
 	allowedCommands = map[string]string{
 		"npx -y @upstash/context7-mcp@latest": "npx -y @upstash/context7-mcp@latest",
 		"npx -y @maximai/mcp-server@latest":   "npx -y @maximai/mcp-server@latest",
 	}
-	mu        sync.Mutex
-	instances = make(map[string]*GatewayInstance)
+
+	// prefixMap tracks active instance per command key
+	prefixMap = make(map[string]*GatewayInstance)
+	// sessionMap tracks session to instance mapping
+	sessionMap = make(map[string]*GatewayInstance)
+	mu         sync.Mutex
 )
 
 func main() {
@@ -42,10 +46,9 @@ func main() {
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
-// multiProxy handles all incoming requests by routing them
-// to the corresponding GatewayInstance based on URL prefix.
+// multiProxy routes SSE and message requests, spawning per-SSE instances
 func multiProxy(w http.ResponseWriter, r *http.Request) {
-	// Preserve raw path (without query)
+	// get raw path without query
 	raw := r.URL.RawPath
 	if raw == "" {
 		raw = r.RequestURI
@@ -54,18 +57,157 @@ func multiProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	raw = strings.TrimPrefix(raw, "/")
-
-	inst, rest := instanceForPath(r, raw)
-	if inst == nil {
-		http.Error(w, "Command not allowed or no gateway found", http.StatusForbidden)
+	parts := strings.SplitN(raw, "/", 2)
+	if len(parts) < 1 {
+		http.NotFound(w, r)
 		return
 	}
 
-	if r.Method == http.MethodPost {
+	// decode command key and rest of path
+	prefix := parts[0]
+	cmdKey, err := url.PathUnescape(prefix)
+	if err != nil {
+		http.Error(w, "Bad prefix encoding", http.StatusBadRequest)
+		return
+	}
+	cmdStr, allowed := allowedCommands[cmdKey]
+	if !allowed {
+		http.Error(w, "Command not allowed", http.StatusForbidden)
+		return
+	}
+
+	rest := "/"
+	if len(parts) == 2 {
+		rest += parts[1]
+	}
+
+	// SSE connect: spawn new instance
+	if r.Method == http.MethodGet && rest == "/sse" {
+		inst := spawnInstance(cmdKey, cmdStr, r)
+		mu.Lock()
+		prefixMap[cmdKey] = inst
+		mu.Unlock()
+
+		// proxy SSE
+		proxySSE(w, r, inst, rest)
+
+		// cleanup on disconnect
+		inst.Cmd.Process.Kill()
+		mu.Lock()
+		delete(prefixMap, cmdKey)
+		for sid, mp := range sessionMap {
+			if mp == inst {
+				delete(sessionMap, sid)
+			}
+		}
+		mu.Unlock()
+		return
+	}
+
+	// message POSTs
+	if r.Method == http.MethodPost && rest == "/message" {
+		sid := r.URL.Query().Get("sessionId")
+		mu.Lock()
+		inst := sessionMap[sid]
+		mu.Unlock()
+		if inst == nil {
+			// first POST: map session to prefix instance
+			mu.Lock()
+			inst = prefixMap[cmdKey]
+			sessionMap[sid] = inst
+			mu.Unlock()
+		}
+		if inst == nil {
+			http.Error(w, "No active session", http.StatusForbidden)
+			return
+		}
 		handlePost(w, r, inst, rest)
 		return
 	}
 
+	// other requests proxy to existing instance
+	mu.Lock()
+	inst := prefixMap[cmdKey]
+	mu.Unlock()
+	if inst == nil {
+		http.Error(w, "No gateway instance", http.StatusBadGateway)
+		return
+	}
+	proxyGeneral(w, r, inst, rest)
+}
+
+// spawnInstance starts a supergateway for each SSE connection
+func spawnInstance(cmdKey, cmdStr string, r *http.Request) *GatewayInstance {
+	// collect env vars
+	envs := os.Environ()
+	for name, vals := range r.Header {
+		up := strings.ToUpper(name)
+		if strings.HasPrefix(up, "ENV_") {
+			envKey := up[len("ENV_"):]
+			envs = append(envs, fmt.Sprintf("%s=%s", envKey, vals[0]))
+		}
+	}
+
+	// pick free port
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	internalURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port))
+	// external baseUrl uses encoded cmdKey
+	external := fmt.Sprintf("http://localhost:8000/%s", url.PathEscape(cmdKey))
+	args := []string{
+		"-y", "supergateway",
+		"--stdio", cmdStr,
+		"--port", strconv.Itoa(port),
+		"--baseUrl", external,
+		"--ssePath", "/sse",
+		"--messagePath", "/message",
+	}
+	log.Printf("Spawning [%s] on %d base %s", cmdKey, port, external)
+	cmd := exec.CommandContext(context.Background(), "npx", args...)
+	cmd.Env = envs
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Start()
+	// allow startup
+	time.Sleep(2 * time.Second)
+	return &GatewayInstance{Cmd: cmd, InternalURL: internalURL}
+}
+
+// proxySSE proxies SSE streams
+func proxySSE(w http.ResponseWriter, r *http.Request, inst *GatewayInstance, rest string) {
+	sseURL := inst.InternalURL.String() + rest + "?" + r.URL.RawQuery
+	req, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, sseURL, nil)
+	req.Header = r.Header.Clone()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		http.Error(w, "SSE proxy failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	for k, vs := range resp.Header {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	reader := bufio.NewReader(resp.Body)
+	flusher, _ := w.(http.Flusher)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			w.Write(line)
+			flusher.Flush()
+		}
+		if err != nil {
+			break
+		}
+	}
+}
+
+// proxyGeneral proxies non-POST, non-SSE requests
+func proxyGeneral(w http.ResponseWriter, r *http.Request, inst *GatewayInstance, rest string) {
 	proxy := httputil.NewSingleHostReverseProxy(inst.InternalURL)
 	orig := proxy.Director
 	proxy.Director = func(req *http.Request) {
@@ -78,56 +220,24 @@ func multiProxy(w http.ResponseWriter, r *http.Request) {
 	proxy.ServeHTTP(w, r)
 }
 
-// instanceForPath determines which instance to use based on URL prefix,
-// spinning up a new one if needed, and returns the rest-of-path.
-func instanceForPath(r *http.Request, raw string) (*GatewayInstance, string) {
-	parts := strings.SplitN(raw, "/", 2)
-	if len(parts) >= 1 {
-		// Decode the command key
-		if key, err := url.PathUnescape(parts[0]); err == nil {
-			if cmdStr, ok := allowedCommands[key]; ok {
-				rest := "/"
-				if len(parts) == 2 {
-					rest += parts[1]
-				}
-				inst := getOrCreateInstance(key, cmdStr, r)
-				return inst, rest
-			}
-		}
-	}
-	return nil, ""
-}
-
-// handlePost proxies POST requests (e.g., /message), preserving query params and logging bodies.
+// handlePost proxies /message POSTs
 func handlePost(w http.ResponseWriter, r *http.Request, inst *GatewayInstance, rest string) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
-		return
-	}
-	log.Printf("POST %s%s?%s -> %s%s; Body: %s", r.Host, r.URL.Path, r.URL.RawQuery, inst.InternalURL, rest, string(body))
-
+	body, _ := io.ReadAll(r.Body)
+	log.Printf("POST %s -> %s%s?%s body: %s", r.URL.Path, inst.InternalURL, rest, r.URL.RawQuery, string(body))
 	target := inst.InternalURL.String() + rest
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, "Failed to create downstream request", http.StatusInternalServerError)
-		return
-	}
+	req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
 	req.Header = r.Header.Clone()
-
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		http.Error(w, "Downstream POST failed", http.StatusBadGateway)
+		http.Error(w, "Post proxy failed", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-
 	respBody, _ := io.ReadAll(resp.Body)
-	log.Printf("Response %d from downstream POST; Body: %s", resp.StatusCode, string(respBody))
-
+	log.Printf("POST response %d body: %s", resp.StatusCode, string(respBody))
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
@@ -135,66 +245,4 @@ func handlePost(w http.ResponseWriter, r *http.Request, inst *GatewayInstance, r
 	}
 	w.WriteHeader(resp.StatusCode)
 	w.Write(respBody)
-}
-
-// getOrCreateInstance starts a new Supergateway subprocess for a given key if not present.
-// Now accepts the HTTP request to extract ENV_ headers for each instance separately.
-func getOrCreateInstance(key, cmdStr string, r *http.Request) *GatewayInstance {
-	mu.Lock()
-	if inst, exists := instances[key]; exists {
-		mu.Unlock()
-		return inst
-	}
-	mu.Unlock()
-
-	// Collect ENV_ headers from this request
-	envs := os.Environ()
-	for name, vals := range r.Header {
-		up := strings.ToUpper(name)
-		if strings.HasPrefix(up, "ENV_") {
-			k := up[len("ENV_"):]
-			envs = append(envs, fmt.Sprintf("%s=%s", k, vals[0]))
-			log.Printf("Setting env %s=%s for instance %s", k, vals[0], key)
-		}
-	}
-
-	// Allocate an internal port
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		log.Fatalf("Port allocation failed: %v", err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
-
-	internal := fmt.Sprintf("http://127.0.0.1:%d", port)
-	internalURL, _ := url.Parse(internal)
-
-	// External baseUrl so client always uses the prefix path
-	externalBase := fmt.Sprintf("http://localhost:8000/%s", url.PathEscape(key))
-
-	args := []string{
-		"-y", "supergateway",
-		"--stdio", cmdStr,
-		"--port", strconv.Itoa(port),
-		"--baseUrl", externalBase,
-		"--ssePath", "/sse",
-		"--messagePath", "/message",
-	}
-	log.Printf("Launching supergateway '%s' on port %d with baseUrl %s", key, port, externalBase)
-	cmd := exec.CommandContext(context.Background(), "npx", args...)
-	cmd.Env = envs
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("Failed to start supergateway: %v", err)
-	}
-
-	// Allow binding
-	time.Sleep(3 * time.Second)
-
-	inst := &GatewayInstance{Cmd: cmd, InternalURL: internalURL}
-	mu.Lock()
-	instances[key] = inst
-	mu.Unlock()
-	return inst
 }
