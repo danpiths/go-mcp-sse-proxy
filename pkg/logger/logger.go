@@ -1,207 +1,100 @@
 package logger
 
 import (
-	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/log"
 )
 
-// LogLevel represents different logging levels
-type LogLevel int
-
-const (
-	LogDebug LogLevel = iota
-	LogInfo
-	LogWarn
-	LogError
+var (
+	Log *log.Logger
 )
 
-func (l LogLevel) String() string {
-	switch l {
-	case LogDebug:
-		return "DEBUG"
-	case LogInfo:
-		return "INFO"
-	case LogWarn:
-		return "WARN"
-	case LogError:
-		return "ERROR"
-	default:
-		return "UNKNOWN"
-	}
-}
-
-// LogEntry represents a structured log entry
-type LogEntry struct {
-	Timestamp     string                 `json:"timestamp"`
-	Level         string                 `json:"level"`
-	Message       string                 `json:"message"`
-	CorrelationID string                 `json:"correlation_id,omitempty"`
-	File          string                 `json:"file,omitempty"`
-	Line          int                    `json:"line,omitempty"`
-	Fields        map[string]interface{} `json:"fields,omitempty"`
-}
-
-// LoggerConfig holds configuration for the logger
-type LoggerConfig struct {
-	Level      LogLevel
-	TimeFormat string
-	// File rotation settings
-	Filename   string
-	MaxSize    int  // megabytes
-	MaxBackups int  // number of backups
-	MaxAge     int  // days
-	Compress   bool // compress old files
-	// Output settings
-	UseConsole bool
-	UseFile    bool
-}
-
-var defaultConfig = LoggerConfig{
-	Level:      LogInfo,
-	TimeFormat: time.RFC3339,
-	MaxSize:    100,   // 100MB
-	MaxBackups: 5,     // 5 backups
-	MaxAge:     30,    // 30 days
-	Compress:   true,  // compress old files
-	UseConsole: true,  // output to console by default
-	UseFile:    false, // don't output to file by default
-}
-
-// Logger provides structured logging with rotation
-type Logger struct {
-	config *LoggerConfig
-	file   *os.File
-	fields map[string]interface{}
-}
-
-// NewLogger creates a new logger with the specified configuration
-func NewLogger(config *LoggerConfig) *Logger {
-	if config == nil {
-		config = &defaultConfig
-	}
-
-	logger := &Logger{
-		config: config,
-		fields: make(map[string]interface{}),
-	}
-
-	if config.UseFile {
-		// Create logs directory if it doesn't exist
-		if err := os.MkdirAll(filepath.Dir(config.Filename), 0755); err != nil {
-			fmt.Printf("Error creating log directory: %v\n", err)
-		}
-
-		// Open log file
-		file, err := os.OpenFile(config.Filename, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-		if err != nil {
-			fmt.Printf("Error opening log file: %v\n", err)
-		} else {
-			logger.file = file
-		}
-	}
-
-	return logger
-}
-
-// WithFields creates a new logger with the additional fields
-func (l *Logger) WithFields(fields map[string]interface{}) *Logger {
-	newLogger := &Logger{
-		config: l.config,
-		file:   l.file,
-		fields: make(map[string]interface{}, len(l.fields)+len(fields)),
-	}
-
-	// Copy existing fields
-	for k, v := range l.fields {
-		newLogger.fields[k] = v
-	}
-
-	// Add new fields
-	for k, v := range fields {
-		newLogger.fields[k] = v
-	}
-
-	return newLogger
-}
-
-// WithCorrelationID creates a new logger with the specified correlation ID
-func (l *Logger) WithCorrelationID(correlationID string) *Logger {
-	if correlationID == "" {
-		correlationID = uuid.New().String()
-	}
-	return l.WithFields(map[string]interface{}{
-		"correlation_id": correlationID,
+func init() {
+	// Create a new logger with rich options
+	Log = log.NewWithOptions(os.Stderr, log.Options{
+		ReportCaller:    true,
+		ReportTimestamp: true,
+		TimeFormat:      time.RFC3339,
+		Prefix:          "🔄 SSE-Proxy",
 	})
+
+	// Set up custom styles for different log levels
+	styles := log.DefaultStyles()
+
+	// Error style - rich red with bold text and padding
+	styles.Levels[log.ErrorLevel] = lipgloss.NewStyle().
+		SetString("ERROR").
+		Padding(0, 1).
+		Bold(true).
+		Background(lipgloss.Color("196")).
+		Foreground(lipgloss.Color("15"))
+
+	// Warning style - yellow with black text
+	styles.Levels[log.WarnLevel] = lipgloss.NewStyle().
+		SetString("WARN").
+		Padding(0, 1).
+		Background(lipgloss.Color("214")).
+		Foreground(lipgloss.Color("0"))
+
+	// Info style - blue with white text
+	styles.Levels[log.InfoLevel] = lipgloss.NewStyle().
+		SetString("INFO").
+		Padding(0, 1).
+		Background(lipgloss.Color("39")).
+		Foreground(lipgloss.Color("15"))
+
+	// Debug style - gray with white text
+	styles.Levels[log.DebugLevel] = lipgloss.NewStyle().
+		SetString("DEBUG").
+		Padding(0, 1).
+		Background(lipgloss.Color("242")).
+		Foreground(lipgloss.Color("15"))
+
+	// Custom styles for specific keys
+	styles.Keys["err"] = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("196")).
+		Bold(true)
+	styles.Values["err"] = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("196")).
+		Italic(true)
+
+	styles.Keys["port"] = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("39")).
+		Bold(true)
+	styles.Values["port"] = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("39")).
+		Underline(true)
+
+	styles.Keys["cmd"] = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("213")).
+		Bold(true)
+	styles.Values["cmd"] = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("213"))
+
+	styles.Keys["url"] = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("83")).
+		Bold(true)
+	styles.Values["url"] = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("83")).
+		Underline(true)
+
+	Log.SetStyles(styles)
 }
 
 // GetLogLevel returns the current log level
-func (l *Logger) GetLogLevel() LogLevel {
-	return l.config.Level
+func GetLogLevel() log.Level {
+	return Log.GetLevel()
 }
 
-// log writes a log message with the given level
-func (l *Logger) log(level LogLevel, format string, args ...interface{}) {
-	if level < l.config.Level {
-		return
-	}
-
-	// Format the message
-	timestamp := time.Now().Format(l.config.TimeFormat)
-	levelStr := ""
-	switch level {
-	case LogDebug:
-		levelStr = "DEBUG"
-	case LogInfo:
-		levelStr = "INFO"
-	case LogWarn:
-		levelStr = "WARN"
-	case LogError:
-		levelStr = "ERROR"
-	}
-
-	message := fmt.Sprintf(format, args...)
-	logLine := fmt.Sprintf("%s [%s] %s\n", timestamp, levelStr, message)
-
-	// Write to console if enabled
-	if l.config.UseConsole {
-		fmt.Print(logLine)
-	}
-
-	// Write to file if enabled and file is open
-	if l.config.UseFile && l.file != nil {
-		if _, err := l.file.WriteString(logLine); err != nil {
-			fmt.Printf("Error writing to log file: %v\n", err)
-		}
-	}
+// SetLogLevel sets the log level
+func SetLogLevel(level log.Level) {
+	Log.SetLevel(level)
 }
 
-// Debug logs a debug message
-func (l *Logger) Debug(format string, args ...interface{}) {
-	l.log(LogDebug, format, args...)
-}
-
-// Info logs an info message
-func (l *Logger) Info(format string, args ...interface{}) {
-	l.log(LogInfo, format, args...)
-}
-
-// Warn logs a warning message
-func (l *Logger) Warn(format string, args ...interface{}) {
-	l.log(LogWarn, format, args...)
-}
-
-// Error logs an error message
-func (l *Logger) Error(format string, args ...interface{}) {
-	l.log(LogError, format, args...)
-}
-
-// Close closes the logger and its file
-func (l *Logger) Close() {
-	if l.file != nil {
-		l.file.Close()
-	}
+// Helper marks the calling function as a helper
+func Helper() {
+	Log.Helper()
 }

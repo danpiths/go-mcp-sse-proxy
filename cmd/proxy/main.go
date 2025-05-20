@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -16,20 +15,20 @@ import (
 	"go-mcp-sse-proxy/internal/ratelimit"
 	"go-mcp-sse-proxy/pkg/logger"
 
+	"github.com/charmbracelet/log"
 	"golang.org/x/time/rate"
 )
 
 func main() {
-	// Initialize logger with configuration
-	log := initLogger()
-	defer log.Close()
+	// Configure global logger
+	configureLogger()
 
 	// Initialize process manager and rate limiter
 	processManager := process.NewManager(config.DefaultProcessConfig())
 	rateLimiter := ratelimit.NewRateLimiter(rate.Limit(100.0/60.0), 10)
 
 	// Setup handlers with dependencies
-	handlers.SetupHandlers(processManager, log)
+	handlers.SetupHandlers(processManager)
 
 	// Create server with middleware chain
 	server := setupServer(rateLimiter)
@@ -40,56 +39,45 @@ func main() {
 
 	// Start server
 	go func() {
-		log.Info("Starting proxy on %s...", server.Addr)
+		logger.Log.Info("Starting proxy",
+			"address", server.Addr)
 		if err := server.ListenAndServe(); err != http.ErrServerClosed {
-			log.Error("HTTP server error: %v", err)
+			logger.Log.Error("HTTP server error",
+				"err", err)
 		}
 	}()
 
 	// Wait for shutdown signal
 	<-shutdown
-	log.Info("Shutdown signal received")
+	logger.Log.Info("Shutdown signal received")
 
 	// Graceful shutdown
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Error("HTTP server shutdown error: %v", err)
+		logger.Log.Error("HTTP server shutdown error",
+			"err", err)
 	}
 
 	processManager.Shutdown()
-	log.Info("Shutdown complete")
+	logger.Log.Info("Shutdown complete")
 }
 
-func initLogger() *logger.Logger {
-	logConfig := &logger.LoggerConfig{
-		Level:      logger.LogDebug,
-		TimeFormat: time.RFC3339,
-		Filename:   filepath.Join("logs", "proxy.log"),
-		MaxSize:    100, // 100MB
-		MaxBackups: 5,   // 5 backups
-		MaxAge:     30,  // 30 days
-		Compress:   true,
-		UseConsole: true,
-		UseFile:    true,
-	}
-
-	// Allow setting log level via environment variable
+func configureLogger() {
+	// Set log level from environment variable
 	if lvl := os.Getenv("LOG_LEVEL"); lvl != "" {
 		switch strings.ToUpper(lvl) {
 		case "DEBUG":
-			logConfig.Level = logger.LogDebug
+			logger.SetLogLevel(log.DebugLevel)
 		case "INFO":
-			logConfig.Level = logger.LogInfo
+			logger.SetLogLevel(log.InfoLevel)
 		case "WARN":
-			logConfig.Level = logger.LogWarn
+			logger.SetLogLevel(log.WarnLevel)
 		case "ERROR":
-			logConfig.Level = logger.LogError
+			logger.SetLogLevel(log.ErrorLevel)
 		}
 	}
-
-	return logger.NewLogger(logConfig)
 }
 
 func setupServer(rateLimiter *ratelimit.RateLimiter) *http.Server {

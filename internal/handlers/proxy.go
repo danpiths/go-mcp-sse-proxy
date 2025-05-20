@@ -25,13 +25,12 @@ import (
 
 var (
 	processManager *process.Manager
-	log            *logger.Logger
+	log            = logger.Log
 )
 
 // SetupHandlers initializes the handlers with required dependencies
-func SetupHandlers(pm *process.Manager, l *logger.Logger) {
+func SetupHandlers(pm *process.Manager) {
 	processManager = pm
-	log = l
 }
 
 // MultiProxy routes SSE and message requests, spawning per-SSE instances
@@ -47,6 +46,7 @@ func MultiProxy(w http.ResponseWriter, r *http.Request) {
 	raw = strings.TrimPrefix(raw, "/")
 	parts := strings.SplitN(raw, "/", 2)
 	if len(parts) < 1 {
+		log.Error("Invalid request path", "path", raw)
 		http.NotFound(w, r)
 		return
 	}
@@ -55,12 +55,14 @@ func MultiProxy(w http.ResponseWriter, r *http.Request) {
 	prefix := parts[0]
 	cmdKey, err := url.PathUnescape(prefix)
 	if err != nil {
+		log.Error("Failed to decode prefix", "prefix", prefix, "err", err)
 		http.Error(w, "Bad prefix encoding", http.StatusBadRequest)
 		return
 	}
 
 	cmdStr, allowed := config.AllowedCommands[cmdKey]
 	if !allowed {
+		log.Warn("Command not allowed", "cmd", cmdKey)
 		http.Error(w, "Command not allowed", http.StatusForbidden)
 		return
 	}
@@ -72,8 +74,17 @@ func MultiProxy(w http.ResponseWriter, r *http.Request) {
 
 	// SSE connect: spawn new instance
 	if r.Method == http.MethodGet && rest == "/sse" {
+		log.Info("New SSE connection",
+			"cmd", cmdKey,
+			"remote_addr", r.RemoteAddr,
+			"user_agent", r.UserAgent())
+
 		inst, err := spawnInstance(cmdKey, cmdStr, r)
 		if err != nil {
+			log.Error("Failed to spawn instance",
+				"cmd", cmdKey,
+				"err", err,
+				"remote_addr", r.RemoteAddr)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
@@ -99,6 +110,9 @@ func MultiProxy(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost && rest == "/message" {
 		sid := r.URL.Query().Get("sessionId")
 		if sid == "" {
+			log.Error("Missing sessionId in POST request",
+				"remote_addr", r.RemoteAddr,
+				"path", r.URL.Path)
 			http.Error(w, "Missing sessionId", http.StatusBadRequest)
 			return
 		}
@@ -108,12 +122,18 @@ func MultiProxy(w http.ResponseWriter, r *http.Request) {
 			// Get instance
 			inst := processManager.GetInstance(cmdKey)
 			if inst == nil {
+				log.Error("No gateway instance found",
+					"cmd", cmdKey,
+					"session_id", sid)
 				http.Error(w, "No gateway instance", http.StatusBadGateway)
 				return
 			}
 
 			// Create new session with supergateway's ID
 			if err := processManager.CreateSession(sid, inst); err != nil {
+				log.Error("Failed to create session",
+					"session_id", sid,
+					"err", err)
 				http.Error(w, err.Error(), http.StatusServiceUnavailable)
 				return
 			}
@@ -130,6 +150,10 @@ func MultiProxy(w http.ResponseWriter, r *http.Request) {
 	// other requests proxy to existing instance
 	inst := processManager.GetInstance(cmdKey)
 	if inst == nil {
+		log.Error("No gateway instance for request",
+			"cmd", cmdKey,
+			"method", r.Method,
+			"path", r.URL.Path)
 		http.Error(w, "No gateway instance", http.StatusBadGateway)
 		return
 	}
@@ -138,6 +162,7 @@ func MultiProxy(w http.ResponseWriter, r *http.Request) {
 
 // spawnInstance starts a supergateway for each SSE connection
 func spawnInstance(cmdKey, cmdStr string, r *http.Request) (*models.GatewayInstance, error) {
+	log.Helper()
 	// Create a context that inherits from the request context
 	ctx, cancel := context.WithCancel(r.Context())
 
@@ -179,7 +204,10 @@ func spawnInstance(cmdKey, cmdStr string, r *http.Request) (*models.GatewayInsta
 		"--ssePath", "/sse",
 		"--messagePath", "/message",
 	}
-	log.Info("Spawning [%s] on %d base %s", cmdKey, port, external)
+	log.Info("Spawning instance",
+		"cmd", cmdKey,
+		"port", port,
+		"url", external)
 
 	cmd := exec.CommandContext(ctx, "npx", args...)
 	cmd.Env = envs
@@ -220,7 +248,9 @@ func spawnInstance(cmdKey, cmdStr string, r *http.Request) (*models.GatewayInsta
 
 	// Try to set process priority
 	if err := process.SetPriority(pgid); err != nil {
-		log.Warn("Failed to set process priority: %v", err)
+		log.Warn("Failed to set process priority",
+			"pid", pgid,
+			"err", err)
 	}
 
 	// Create health check context with timeout
@@ -260,12 +290,17 @@ func spawnInstance(cmdKey, cmdStr string, r *http.Request) (*models.GatewayInsta
 		outputHandler.Wait()
 		if err := cmd.Wait(); err != nil {
 			if ctx.Err() == context.Canceled {
-				log.Info("Process [%s] was cancelled", cmdKey)
+				log.Info("Process cancelled", "cmd", cmdKey)
 			} else {
-				log.Error("Process [%s] exited with error: %v", cmdKey, err)
+				log.Error("Process exited with error",
+					"cmd", cmdKey,
+					"err", err,
+					"pid", pgid)
 			}
 		} else {
-			log.Info("Process [%s] exited successfully", cmdKey)
+			log.Info("Process exited successfully",
+				"cmd", cmdKey,
+				"pid", pgid)
 		}
 	}()
 
@@ -274,6 +309,7 @@ func spawnInstance(cmdKey, cmdStr string, r *http.Request) (*models.GatewayInsta
 
 // proxySSE proxies SSE streams
 func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstance, rest string) {
+	log.Helper()
 	// Create a context without timeout for the SSE connection
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -285,14 +321,17 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 	// Handle client disconnection
 	go func() {
 		<-r.Context().Done()
-		log.Debug("Client connection closed")
+		log.Debug("Client connection closed",
+			"remote_addr", r.RemoteAddr)
 		cancel()
 	}()
 
 	sseURL := inst.InternalURL.String() + rest + "?" + r.URL.RawQuery
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sseURL, nil)
 	if err != nil {
-		log.Error("Failed to create SSE request: %v", err)
+		log.Error("Failed to create SSE request",
+			"url", sseURL,
+			"err", err)
 		http.Error(w, "Failed to create SSE request", http.StatusInternalServerError)
 		return
 	}
@@ -368,12 +407,17 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 		}
 		if i < maxRetries-1 {
 			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
-			log.Warn("Retrying SSE connection after error: %v (attempt %d/%d)", connErr, i+1, maxRetries)
+			log.Warn("Retrying SSE connection",
+				"attempt", i+1,
+				"max_attempts", maxRetries,
+				"err", connErr)
 		}
 	}
 
 	if connErr != nil {
-		log.Error("SSE connection failed after %d attempts: %v", maxRetries, connErr)
+		log.Error("SSE connection failed",
+			"max_attempts", maxRetries,
+			"err", connErr)
 		http.Error(w, "SSE connection failed", http.StatusBadGateway)
 		return
 	}
@@ -398,7 +442,8 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Error("Recovered from panic in reader goroutine: %v", r)
+				log.Error("Reader goroutine panic",
+					"panic", r)
 				errCh <- fmt.Errorf("reader panic: %v", r)
 			}
 		}()
@@ -417,7 +462,8 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 
 					if _, writeErr := w.Write(line); writeErr != nil {
 						if !isConnectionError(writeErr) {
-							log.Error("Failed to write SSE data: %v", writeErr)
+							log.Error("Failed to write SSE data",
+								"err", writeErr)
 							errCh <- writeErr
 						}
 						return
@@ -427,7 +473,8 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 			}
 			if err != nil {
 				if !isConnectionError(err) {
-					log.Error("Error reading SSE data: %v", err)
+					log.Error("Error reading SSE data",
+						"err", err)
 					errCh <- err
 				}
 				return
@@ -442,7 +489,8 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 			log.Info("SSE connection cancelled")
 			return
 		case err := <-errCh:
-			log.Error("SSE connection error: %v", err)
+			log.Error("SSE connection error",
+				"err", err)
 			return
 		case <-heartbeat.C:
 			select {
@@ -456,7 +504,8 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 
 				if _, err := w.Write([]byte(": heartbeat\n\n")); err != nil {
 					if !isConnectionError(err) {
-						log.Error("Failed to write heartbeat: %v", err)
+						log.Error("Failed to write heartbeat",
+							"err", err)
 					}
 					return
 				}
@@ -481,6 +530,7 @@ func isConnectionError(err error) bool {
 
 // proxyGeneral proxies non-POST, non-SSE requests
 func proxyGeneral(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstance, rest string) {
+	log.Helper()
 	proxy := httputil.NewSingleHostReverseProxy(inst.InternalURL)
 	orig := proxy.Director
 	proxy.Director = func(req *http.Request) {
@@ -495,17 +545,20 @@ func proxyGeneral(w http.ResponseWriter, r *http.Request, inst *models.GatewayIn
 
 // handlePost proxies /message POSTs
 func handlePost(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstance, rest string) {
+	log.Helper()
 	body, _ := io.ReadAll(r.Body)
 
-	if log.GetLogLevel() <= logger.LogDebug {
-		log.Debug("POST %s -> %s%s?%s",
-			r.URL.Path,
-			inst.InternalURL.String(),
-			rest,
-			r.URL.RawQuery)
-		log.Debug("Request body: %s", string(body))
+	if log.GetLevel() <= logger.Log.GetLevel() {
+		log.Debug("POST request details",
+			"path", r.URL.Path,
+			"target", fmt.Sprintf("%s%s?%s",
+				inst.InternalURL.String(),
+				rest,
+				r.URL.RawQuery),
+			"body", string(body))
 	} else {
-		log.Info("Received POST request to %s", r.URL.Path)
+		log.Info("Received POST request",
+			"path", r.URL.Path)
 	}
 
 	target := inst.InternalURL.String() + rest
@@ -543,12 +596,17 @@ func handlePost(w http.ResponseWriter, r *http.Request, inst *models.GatewayInst
 		}
 		if i < maxRetries-1 {
 			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
-			log.Warn("Retrying POST request after error: %v (attempt %d/%d)", err, i+1, maxRetries)
+			log.Warn("Retrying POST request",
+				"attempt", i+1,
+				"max_attempts", maxRetries,
+				"err", err)
 		}
 	}
 
 	if err != nil {
-		log.Error("Post proxy failed after %d attempts: %v", maxRetries, err)
+		log.Error("Post proxy failed",
+			"max_attempts", maxRetries,
+			"err", err)
 		http.Error(w, "Post proxy failed", http.StatusBadGateway)
 		return
 	}
@@ -556,10 +614,13 @@ func handlePost(w http.ResponseWriter, r *http.Request, inst *models.GatewayInst
 
 	respBody, _ := io.ReadAll(resp.Body)
 
-	if log.GetLogLevel() <= logger.LogDebug {
-		log.Debug("Response status: %d, body: %s", resp.StatusCode, string(respBody))
+	if log.GetLevel() <= logger.Log.GetLevel() {
+		log.Debug("Response details",
+			"status", resp.StatusCode,
+			"body", string(respBody))
 	} else {
-		log.Info("Response status: %d", resp.StatusCode)
+		log.Info("Response received",
+			"status", resp.StatusCode)
 	}
 
 	for k, vs := range resp.Header {

@@ -3,25 +3,17 @@ package process
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"go-mcp-sse-proxy/pkg/logger"
 )
-
-var log *logger.Logger
-
-func init() {
-	// Initialize with default configuration
-	log = logger.NewLogger(&logger.LoggerConfig{
-		Level:      logger.LogDebug,
-		UseConsole: true,
-	})
-}
 
 // processOutputHandler manages the output streams of a process
 type processOutputHandler struct {
@@ -32,7 +24,11 @@ type processOutputHandler struct {
 	cancel    context.CancelFunc // Cancel function for cleanup
 	maxBuffer int                // Maximum buffer size for output channels
 	wg        sync.WaitGroup     // WaitGroup for tracking goroutines
-	logger    *logger.Logger     // Logger instance
+
+	// Buffer for accumulating JSON lines
+	jsonBuffer   strings.Builder
+	inJSONObject bool
+	bracketCount int
 }
 
 const (
@@ -42,7 +38,7 @@ const (
 	drainTimeout     = 5 * time.Second        // Timeout for draining channels during shutdown
 )
 
-func newProcessOutputHandler(stdout, stderr io.Reader, l *logger.Logger) *processOutputHandler {
+func newProcessOutputHandler(stdout, stderr io.Reader) *processOutputHandler {
 	ctx, cancel := context.WithCancel(context.Background())
 	handler := &processOutputHandler{
 		stdout:    bufio.NewReaderSize(stdout, maxLineLength),
@@ -51,10 +47,66 @@ func newProcessOutputHandler(stdout, stderr io.Reader, l *logger.Logger) *proces
 		ctx:       ctx,
 		cancel:    cancel,
 		maxBuffer: defaultMaxBuffer,
-		logger:    l,
 	}
 	go handler.handle()
 	return handler
+}
+
+func (h *processOutputHandler) processLine(line string) {
+	// Check if line starts a new JSON object
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "{") {
+		h.inJSONObject = true
+		h.jsonBuffer.Reset()
+		h.bracketCount = 0
+	}
+
+	if h.inJSONObject {
+		h.jsonBuffer.WriteString(trimmed)
+
+		// Count brackets
+		h.bracketCount += strings.Count(trimmed, "{") - strings.Count(trimmed, "}")
+
+		// If brackets are balanced, we have a complete JSON object
+		if h.bracketCount == 0 {
+			h.inJSONObject = false
+			jsonStr := h.jsonBuffer.String()
+
+			// Try to parse and pretty print the JSON
+			var jsonData map[string]interface{}
+			if err := json.Unmarshal([]byte(jsonStr), &jsonData); err == nil {
+				// Extract meaningful information from the JSON
+				if method, ok := jsonData["method"].(string); ok {
+					logger.Log.Debug("Process JSON message",
+						"method", method,
+						"data", jsonData)
+				} else if errObj, ok := jsonData["error"].(map[string]interface{}); ok {
+					logger.Log.Error("Process error",
+						"code", errObj["code"],
+						"message", errObj["message"])
+				} else {
+					logger.Log.Debug("Process output",
+						"json", jsonData)
+				}
+			} else {
+				// If not valid JSON, log the raw string
+				logger.Log.Debug("Process output",
+					"raw", jsonStr)
+			}
+		}
+	} else {
+		// Handle non-JSON lines
+		if strings.Contains(trimmed, "SSE ↔ Child") {
+			logger.Log.Debug("SSE connection event",
+				"event", trimmed)
+		} else if strings.Contains(trimmed, "POST to SSE transport") {
+			logger.Log.Debug("SSE transport event",
+				"event", trimmed)
+		} else if len(trimmed) > 0 {
+			logger.Log.Debug("Process output",
+				"message", trimmed)
+		}
+	}
 }
 
 func (h *processOutputHandler) handle() {
@@ -87,12 +139,12 @@ func (h *processOutputHandler) handle() {
 			if !ok {
 				continue
 			}
-			h.logger.Debug("[Process stdout] %s", line)
+			h.processLine(line)
 		case line, ok := <-stderrCh:
 			if !ok {
 				continue
 			}
-			h.logger.Debug("[Process stderr] %s", line)
+			h.processLine(line)
 		}
 	}
 }
@@ -107,12 +159,12 @@ func (h *processOutputHandler) drainChannels(ctx context.Context, stdoutCh, stde
 			if !ok {
 				return
 			}
-			h.logger.Debug("[Process stdout] (drain) %s", line)
+			h.processLine(line)
 		case line, ok := <-stderrCh:
 			if !ok {
 				return
 			}
-			h.logger.Debug("[Process stderr] (drain) %s", line)
+			h.processLine(line)
 		default:
 			// No more messages to drain
 			return
@@ -134,7 +186,9 @@ func (h *processOutputHandler) readOutput(reader *bufio.Reader, ch chan<- string
 			line, err := reader.ReadString('\n')
 			if err != nil {
 				if err != io.EOF {
-					h.logger.Error("Error reading from %s: %v", name, err)
+					logger.Log.Error("Error reading from stream",
+						"stream", name,
+						"err", err)
 				}
 				return
 			}
@@ -147,7 +201,8 @@ func (h *processOutputHandler) readOutput(reader *bufio.Reader, ch chan<- string
 				// Successfully wrote to channel
 			case <-time.After(writeTimeout):
 				// Channel is full, log warning and continue
-				h.logger.Warn("Buffer full for %s, dropping line", name)
+				logger.Log.Warn("Buffer full, dropping line",
+					"stream", name)
 			}
 		}
 	}
@@ -164,7 +219,7 @@ func (h *processOutputHandler) Stop() {
 
 // NewProcessOutputHandler creates a new process output handler
 func NewProcessOutputHandler(stdout, stderr io.Reader) *processOutputHandler {
-	return newProcessOutputHandler(stdout, stderr, log)
+	return newProcessOutputHandler(stdout, stderr)
 }
 
 // SetPriority attempts to set process priority (nice value) on supported platforms

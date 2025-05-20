@@ -12,6 +12,7 @@ import (
 	"go-mcp-sse-proxy/internal/config"
 	"go-mcp-sse-proxy/internal/models"
 	"go-mcp-sse-proxy/internal/utils"
+	"go-mcp-sse-proxy/pkg/logger"
 )
 
 // Manager handles lifecycle of gateway instances
@@ -71,7 +72,8 @@ func (pm *Manager) cleanupExpiredSessions() {
 		if now.Sub(session.LastUsed) > pm.sessionTimeout &&
 			session.Instance != nil &&
 			session.Instance.Sessions.Load() <= 0 {
-			log.Info("Cleaning up expired session: %s", sid)
+			logger.Log.Info("Cleaning up expired session",
+				"session_id", sid)
 			delete(pm.sessions, sid)
 		}
 	}
@@ -86,7 +88,8 @@ func (pm *Manager) cleanupExpiredProcesses() {
 
 	for key, inst := range pm.instances {
 		if now.Sub(inst.StartTime) > pm.maxLifetime {
-			log.Info("Terminating expired process for key: %s", key)
+			logger.Log.Info("Terminating expired process",
+				"cmd", key)
 			pm.terminateInstance(key, inst)
 		}
 	}
@@ -115,7 +118,8 @@ func (pm *Manager) terminateInstance(key string, inst *models.GatewayInstance) {
 		// First try graceful shutdown with SIGTERM
 		if err := inst.Cmd.Process.Signal(syscall.SIGTERM); err != nil {
 			if !strings.Contains(err.Error(), "process already finished") {
-				log.Error("Failed to send SIGTERM to process: %v", err)
+				logger.Log.Error("Failed to send SIGTERM to process",
+					"err", err)
 			}
 		}
 
@@ -123,16 +127,18 @@ func (pm *Manager) terminateInstance(key string, inst *models.GatewayInstance) {
 		select {
 		case err := <-done:
 			if err != nil && !strings.Contains(err.Error(), "signal: killed") {
-				log.Error("Process exited with error: %v", err)
+				logger.Log.Error("Process exited with error",
+					"err", err)
 			} else {
-				log.Info("Process terminated gracefully")
+				logger.Log.Info("Process terminated gracefully")
 			}
 		case <-cleanupCtx.Done():
 			// Process didn't exit gracefully, force kill
-			log.Warn("Process did not exit gracefully, forcing kill")
+			logger.Log.Warn("Process did not exit gracefully, forcing kill")
 			if err := inst.Cmd.Process.Kill(); err != nil {
 				if !strings.Contains(err.Error(), "process already finished") {
-					log.Error("Failed to kill process: %v", err)
+					logger.Log.Error("Failed to kill process",
+						"err", err)
 				}
 			}
 		}
@@ -155,7 +161,7 @@ func (pm *Manager) cleanupInstanceAndSessions(key string, inst *models.GatewayIn
 
 	// First acquire instancesMu
 	if !utils.TryLock(&pm.instancesMu, lockTimeout) {
-		log.Error("Failed to acquire instance lock for cleanup")
+		logger.Log.Error("Failed to acquire instance lock for cleanup")
 		return
 	}
 	// Only delete if it's still the same instance
@@ -166,7 +172,7 @@ func (pm *Manager) cleanupInstanceAndSessions(key string, inst *models.GatewayIn
 
 	// Then acquire sessionsMu
 	if !utils.TryLock(&pm.sessionsMu, lockTimeout) {
-		log.Error("Failed to acquire session lock for cleanup")
+		logger.Log.Error("Failed to acquire session lock for cleanup")
 		return
 	}
 	defer pm.sessionsMu.Unlock()
@@ -190,7 +196,8 @@ func (pm *Manager) Shutdown() {
 	defer pm.instancesMu.Unlock()
 
 	for key, inst := range pm.instances {
-		log.Info("Shutting down instance: %s", key)
+		logger.Log.Info("Shutting down instance",
+			"cmd", key)
 		pm.terminateInstance(key, inst)
 	}
 }
@@ -227,7 +234,7 @@ func (pm *Manager) TouchSession(sessionID string) bool {
 	const lockTimeout = 5 * time.Second
 
 	if !utils.TryLock(&pm.sessionsMu, lockTimeout) {
-		log.Error("Failed to acquire session lock for touch")
+		logger.Log.Error("Failed to acquire session lock for touch")
 		return false
 	}
 	defer pm.sessionsMu.Unlock()
