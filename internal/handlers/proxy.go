@@ -78,11 +78,20 @@ func MultiProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// proxy SSE and let supergateway handle session creation
-		proxySSE(w, r, inst, rest)
+		// Create a done channel to coordinate cleanup
+		done := make(chan struct{})
 
-		// cleanup on disconnect
-		processManager.TerminateInstance(cmdKey, inst)
+		// Start cleanup goroutine that waits for SSE to actually end
+		go func() {
+			defer close(done)
+			// proxy SSE and let supergateway handle session creation
+			proxySSE(w, r, inst, rest)
+			// Only cleanup after SSE connection actually ends
+			processManager.TerminateInstance(cmdKey, inst)
+		}()
+
+		// Wait for cleanup to complete
+		<-done
 		return
 	}
 
@@ -265,8 +274,8 @@ func spawnInstance(cmdKey, cmdStr string, r *http.Request) (*models.GatewayInsta
 
 // proxySSE proxies SSE streams
 func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstance, rest string) {
-	// Create a context with timeout for the SSE connection
-	ctx, cancel := context.WithCancel(r.Context())
+	// Create a context without timeout for the SSE connection
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Create a done channel to handle connection close
@@ -275,18 +284,9 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 
 	// Handle client disconnection
 	go func() {
-		select {
-		case <-r.Context().Done():
-			log.Debug("Client connection closed")
-			select {
-			case <-done:
-				return
-			default:
-				cancel()
-			}
-		case <-done:
-			return
-		}
+		<-r.Context().Done()
+		log.Debug("Client connection closed")
+		cancel()
 	}()
 
 	sseURL := inst.InternalURL.String() + rest + "?" + r.URL.RawQuery
@@ -314,19 +314,46 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 		return
 	}
 
-	// Use a custom transport with longer timeouts
+	// Use a custom transport with optimized settings for SSE
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			DualStack: true,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		DisableKeepAlives:     false,
+		MaxIdleConnsPerHost:   100,
+	}
+
+	// Enable TCP keep-alive
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialer := &net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			DualStack: true,
+		}
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			tc.SetKeepAlive(true)
+			tc.SetKeepAlivePeriod(30 * time.Second)
+			tc.SetNoDelay(true)
+		}
+		return conn, nil
+	}
+
 	client := &http.Client{
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: 5 * time.Minute,
-			IdleConnTimeout:       10 * time.Minute,
-			DisableKeepAlives:     false,
-			MaxIdleConnsPerHost:   100,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-		},
-		Timeout: 0, // No timeout for SSE connections
+		Transport: transport,
+		Timeout:   0, // No timeout for SSE connections
 	}
 
 	// Add retry logic for initial connection
@@ -334,7 +361,7 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 	var resp *http.Response
 	var connErr error
 
-	for i := 0; i < maxRetries; i++ {
+	for i := range maxRetries {
 		resp, connErr = client.Do(req)
 		if connErr == nil {
 			break
@@ -361,34 +388,95 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 	w.WriteHeader(resp.StatusCode)
 
 	reader := bufio.NewReaderSize(resp.Body, 4096)
+	heartbeat := time.NewTicker(15 * time.Second) // More frequent heartbeat
+	defer heartbeat.Stop()
+
+	// Create error channel for connection errors
+	errCh := make(chan error, 1)
+
+	// Start reader goroutine
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error("Recovered from panic in reader goroutine: %v", r)
+				errCh <- fmt.Errorf("reader panic: %v", r)
+			}
+		}()
+
+		for {
+			line, err := reader.ReadBytes('\n')
+			if len(line) > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					// Set a write deadline for each write operation
+					if conn, ok := w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+						conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					}
+
+					if _, writeErr := w.Write(line); writeErr != nil {
+						if !isConnectionError(writeErr) {
+							log.Error("Failed to write SSE data: %v", writeErr)
+							errCh <- writeErr
+						}
+						return
+					}
+					flusher.Flush()
+				}
+			}
+			if err != nil {
+				if !isConnectionError(err) {
+					log.Error("Error reading SSE data: %v", err)
+					errCh <- err
+				}
+				return
+			}
+		}
+	}()
+
+	// Main event loop
 	for {
 		select {
 		case <-ctx.Done():
-			if ctx.Err() == context.Canceled {
-				log.Info("SSE connection cancelled")
-			} else {
-				log.Info("SSE connection timeout: %v", ctx.Err())
-			}
+			log.Info("SSE connection cancelled")
 			return
-		default:
-			line, err := reader.ReadBytes('\n')
-			if len(line) > 0 {
-				if _, writeErr := w.Write(line); writeErr != nil {
-					if !strings.Contains(writeErr.Error(), "broken pipe") && !strings.Contains(writeErr.Error(), "connection reset by peer") {
-						log.Error("Failed to write SSE data: %v", writeErr)
+		case err := <-errCh:
+			log.Error("SSE connection error: %v", err)
+			return
+		case <-heartbeat.C:
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				// Set a write deadline for heartbeat
+				if conn, ok := w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+					conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				}
+
+				if _, err := w.Write([]byte(": heartbeat\n\n")); err != nil {
+					if !isConnectionError(err) {
+						log.Error("Failed to write heartbeat: %v", err)
 					}
 					return
 				}
 				flusher.Flush()
 			}
-			if err != nil {
-				if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
-					log.Error("Error reading SSE data: %v", err)
-				}
-				return
-			}
 		}
 	}
+}
+
+// isConnectionError returns true if the error is a normal connection closure or timeout
+func isConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "connection reset by peer") ||
+		strings.Contains(errStr, "use of closed network connection") ||
+		strings.Contains(errStr, "i/o timeout") ||
+		err == io.EOF
 }
 
 // proxyGeneral proxies non-POST, non-SSE requests
@@ -436,7 +524,11 @@ func handlePost(w http.ResponseWriter, r *http.Request, inst *models.GatewayInst
 		},
 	}
 
-	req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, target, bytes.NewReader(body))
+	// Create a new request context that doesn't affect the SSE connection
+	postCtx, postCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer postCancel()
+
+	req, _ := http.NewRequestWithContext(postCtx, http.MethodPost, target, bytes.NewReader(body))
 	req.Header = r.Header.Clone()
 
 	// Add retry logic
@@ -444,7 +536,7 @@ func handlePost(w http.ResponseWriter, r *http.Request, inst *models.GatewayInst
 	var resp *http.Response
 	var err error
 
-	for i := 0; i < maxRetries; i++ {
+	for i := range maxRetries {
 		resp, err = client.Do(req)
 		if err == nil {
 			break

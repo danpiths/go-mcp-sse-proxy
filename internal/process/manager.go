@@ -3,7 +3,6 @@ package process
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -61,16 +60,18 @@ func (pm *Manager) cleanupLoop() {
 
 // cleanupExpiredSessions removes sessions that have been inactive
 func (pm *Manager) cleanupExpiredSessions() {
-	now := time.Now()
 	pm.sessionsMu.Lock()
 	defer pm.sessionsMu.Unlock()
 
+	now := time.Now()
+
 	for sid, session := range pm.sessions {
-		if now.Sub(session.LastUsed) > pm.sessionTimeout {
+		// Only cleanup sessions that have been inactive for longer than the timeout
+		// and don't have any active SSE connections
+		if now.Sub(session.LastUsed) > pm.sessionTimeout &&
+			session.Instance != nil &&
+			session.Instance.Sessions.Load() <= 0 {
 			log.Info("Cleaning up expired session: %s", sid)
-			if session.Instance != nil {
-				session.Instance.Sessions.Add(-1)
-			}
 			delete(pm.sessions, sid)
 		}
 	}
@@ -78,9 +79,10 @@ func (pm *Manager) cleanupExpiredSessions() {
 
 // cleanupExpiredProcesses terminates processes that have exceeded maxLifetime
 func (pm *Manager) cleanupExpiredProcesses() {
-	now := time.Now()
 	pm.instancesMu.Lock()
 	defer pm.instancesMu.Unlock()
+
+	now := time.Now()
 
 	for key, inst := range pm.instances {
 		if now.Sub(inst.StartTime) > pm.maxLifetime {
@@ -256,31 +258,6 @@ func (pm *Manager) AddInstance(key string, instance *models.GatewayInstance) {
 	pm.instancesMu.Lock()
 	defer pm.instancesMu.Unlock()
 	pm.instances[key] = instance
-}
-
-// setPriority attempts to set process priority (nice value) on supported platforms
-func setPriority(pid int) error {
-	// On Unix-like systems, we can use setpriority
-	return syscall.Setpriority(syscall.PRIO_PROCESS, pid, 10)
-}
-
-// healthCheck attempts to connect to the spawned process
-func healthCheck(url string, ctx context.Context) error {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("health check failed: %w", ctx.Err())
-		case <-ticker.C:
-			resp, err := http.Get(url)
-			if err == nil {
-				resp.Body.Close()
-				return nil // Any HTTP response means process is up
-			}
-		}
-	}
 }
 
 // GetPort gets a port from the port manager

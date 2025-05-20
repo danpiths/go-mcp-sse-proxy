@@ -86,7 +86,7 @@ func (pm *PortManager) GetPort() (int, error) {
 	if pm.releasedPorts != nil {
 		// Try each port in the ring buffer
 		current := pm.releasedPorts
-		for i := 0; i < pm.maxReleased; i++ {
+		for range pm.maxReleased {
 			if port, ok := current.Value.(int); ok && port != 0 {
 				// Verify the port is actually free
 				if !pm.usedPorts[port] && pm.isPortAvailable(port) {
@@ -99,7 +99,7 @@ func (pm *PortManager) GetPort() (int, error) {
 	}
 
 	// Try to find a new port within range
-	for attempt := 0; attempt < pm.maxRetries; attempt++ {
+	for range pm.maxRetries {
 		// Try to get a port from the system
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {

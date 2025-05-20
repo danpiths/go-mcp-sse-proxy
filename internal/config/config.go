@@ -23,7 +23,7 @@ type ProcessConfig struct {
 // DefaultTimeoutConfig returns sensible default timeout configuration
 func DefaultTimeoutConfig() TimeoutConfig {
 	return TimeoutConfig{
-		SSETimeout:        24 * time.Hour,
+		SSETimeout:        1 * time.Hour,
 		RequestTimeout:    60 * time.Second,
 		ShutdownTimeout:   60 * time.Second,
 		HealthCheckPeriod: 30 * time.Second,
@@ -38,7 +38,7 @@ func DefaultProcessConfig() ProcessConfig {
 		MaxTotalSessions: 1000, // Max 1000 total sessions
 		SessionTimeout:   30 * time.Minute,
 		CleanupInterval:  1 * time.Minute,
-		GracefulTimeout:  5 * time.Second,
+		GracefulTimeout:  10 * time.Second,
 	}
 }
 
