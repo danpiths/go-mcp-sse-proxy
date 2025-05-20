@@ -197,7 +197,6 @@ func spawnInstance(cmdKey, cmdStr string, r *http.Request) (*models.GatewayInsta
 	// external baseUrl uses encoded cmdKey
 	external := fmt.Sprintf("http://localhost:8000/%s", url.PathEscape(cmdKey))
 	args := []string{
-		"-y", "supergateway",
 		"--stdio", cmdStr,
 		"--port", strconv.Itoa(port),
 		"--baseUrl", external,
@@ -209,7 +208,7 @@ func spawnInstance(cmdKey, cmdStr string, r *http.Request) (*models.GatewayInsta
 		"port", port,
 		"url", external)
 
-	cmd := exec.CommandContext(ctx, "npx", args...)
+	cmd := exec.CommandContext(ctx, "supergateway", args...)
 	cmd.Env = envs
 
 	// Set up process group

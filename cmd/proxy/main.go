@@ -84,7 +84,9 @@ func setupServer(rateLimiter *ratelimit.RateLimiter) *http.Server {
 	// Create handler chain with security middleware
 	handler := handlers.RateLimitMiddleware(rateLimiter)(
 		handlers.SecurityHeaders(
-			http.HandlerFunc(handlers.MultiProxy),
+			handlers.AuthMiddleware(
+				http.HandlerFunc(handlers.MultiProxy),
+			),
 		),
 	)
 
