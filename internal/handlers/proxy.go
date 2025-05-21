@@ -235,7 +235,18 @@ func spawnInstance(cmdKey, cmdStr string, r *http.Request) (*models.GatewayInsta
 	// Start output handler
 	outputHandler := process.NewProcessOutputHandler(stdout, stderr)
 
+	// Create a temporary directory for the process
+	tmpDir, err := os.MkdirTemp("", "supergateway-*")
+	if err != nil {
+		processManager.ReleasePort(port)
+		cancel()
+		outputHandler.Stop()
+		return nil, fmt.Errorf("failed to create temp directory: %w", err)
+	}
+	cmd.Dir = tmpDir
+
 	if err := cmd.Start(); err != nil {
+		os.RemoveAll(tmpDir) // Clean up temp dir
 		processManager.ReleasePort(port)
 		cancel()
 		outputHandler.Stop()
@@ -259,6 +270,7 @@ func spawnInstance(cmdKey, cmdStr string, r *http.Request) (*models.GatewayInsta
 	// Perform health check
 	healthCheckURL := internalURL.String()
 	if err := process.HealthCheck(healthCheckURL, healthCtx); err != nil {
+		os.RemoveAll(tmpDir) // Clean up temp dir
 		// Kill entire process group
 		syscall.Kill(-pgid, syscall.SIGKILL)
 		processManager.ReleasePort(port)
@@ -274,6 +286,7 @@ func spawnInstance(cmdKey, cmdStr string, r *http.Request) (*models.GatewayInsta
 	go func() {
 		defer func() {
 			outputHandler.Stop()
+			os.RemoveAll(tmpDir) // Clean up temp dir
 			processManager.ReleasePort(port)
 			processManager.RemoveInstance(cmdKey)
 

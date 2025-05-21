@@ -44,8 +44,9 @@ func DefaultProcessConfig() ProcessConfig {
 
 // AllowedCommands maps unescaped command strings to their actual invocations
 var AllowedCommands = map[string]string{
-	"npx -y @upstash/context7-mcp@latest": "npx -y @upstash/context7-mcp@latest",
-	"npx -y @maximai/mcp-server@latest":   "npx -y @maximai/mcp-server@latest",
+	"npx -y @upstash/context7-mcp@latest":                                                 "npx -y @upstash/context7-mcp@latest",
+	"npx -y @maximai/mcp-server@latest":                                                   "npx -y @maximai/mcp-server@latest",
+	"docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server": "docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server",
 }
 
 // BlacklistedEnvVars contains environment variables that should never be overwritten
