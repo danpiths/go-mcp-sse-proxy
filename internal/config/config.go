@@ -24,7 +24,7 @@ type ProcessConfig struct {
 func DefaultTimeoutConfig() TimeoutConfig {
 	return TimeoutConfig{
 		SSETimeout:        1 * time.Hour,
-		RequestTimeout:    60 * time.Second,
+		RequestTimeout:    3 * time.Minute,
 		ShutdownTimeout:   60 * time.Second,
 		HealthCheckPeriod: 30 * time.Second,
 	}

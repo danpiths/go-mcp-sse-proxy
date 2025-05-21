@@ -264,7 +264,7 @@ func spawnInstance(cmdKey, cmdStr string, r *http.Request) (*models.GatewayInsta
 	}
 
 	// Create health check context with timeout
-	healthCtx, healthCancel := context.WithTimeout(ctx, 30*time.Second)
+	healthCtx, healthCancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer healthCancel()
 
 	// Perform health check
