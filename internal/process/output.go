@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"go-mcp-sse-proxy/internal/config"
 	"go-mcp-sse-proxy/pkg/logger"
 )
 
@@ -229,7 +230,7 @@ func SetPriority(pid int) error {
 
 // HealthCheck attempts to connect to the spawned process
 func HealthCheck(url string, ctx context.Context) error {
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(config.DefaultTimeoutConfig().PollInterval)
 	defer ticker.Stop()
 
 	for {

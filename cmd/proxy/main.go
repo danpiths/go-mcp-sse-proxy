@@ -7,7 +7,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
 	"go-mcp-sse-proxy/internal/config"
 	"go-mcp-sse-proxy/internal/handlers"
@@ -52,7 +51,7 @@ func main() {
 	logger.Log.Info("Shutdown signal received")
 
 	// Graceful shutdown
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), config.DefaultTimeoutConfig().ShutdownTimeout)
 	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
@@ -81,6 +80,9 @@ func configureLogger() {
 }
 
 func setupServer(rateLimiter *ratelimit.RateLimiter) *http.Server {
+	// Get timeout configurations
+	timeoutConfig := config.DefaultTimeoutConfig()
+
 	// Create handler chain with security middleware
 	handler := handlers.RateLimitMiddleware(rateLimiter)(
 		handlers.SecurityHeaders(
@@ -93,8 +95,8 @@ func setupServer(rateLimiter *ratelimit.RateLimiter) *http.Server {
 	return &http.Server{
 		Addr:         ":8000",
 		Handler:      handler,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  timeoutConfig.RequestTimeout,
+		WriteTimeout: timeoutConfig.RequestTimeout,
+		IdleTimeout:  timeoutConfig.SSETimeout,
 	}
 }

@@ -50,7 +50,7 @@ if check_machine_exists; then
         sleep 10
 
         echo "🗑️ Destroying existing DinD container..."
-        fly machine destroy "$machine_id"
+        fly machine destroy "$machine_id" --force
         # Wait a bit for the destruction to complete
         sleep 10
     fi

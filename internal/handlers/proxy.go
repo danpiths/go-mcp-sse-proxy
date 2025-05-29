@@ -264,7 +264,7 @@ func spawnInstance(cmdKey, cmdStr string, r *http.Request) (*models.GatewayInsta
 	}
 
 	// Create health check context with timeout
-	healthCtx, healthCancel := context.WithTimeout(ctx, 3*time.Minute)
+	healthCtx, healthCancel := context.WithTimeout(ctx, config.DefaultTimeoutConfig().InitialStartupDelay)
 	defer healthCancel()
 
 	// Perform health check
@@ -272,7 +272,9 @@ func spawnInstance(cmdKey, cmdStr string, r *http.Request) (*models.GatewayInsta
 	if err := process.HealthCheck(healthCheckURL, healthCtx); err != nil {
 		os.RemoveAll(tmpDir) // Clean up temp dir
 		// Kill entire process group
-		syscall.Kill(-pgid, syscall.SIGKILL)
+		inst := models.NewGatewayInstance(cmd, internalURL, cancel)
+		processManager.AddInstance(cmdKey, inst)
+		processManager.TerminateInstance(cmdKey, inst)
 		processManager.ReleasePort(port)
 		cancel()
 		outputHandler.Stop()
@@ -355,7 +357,7 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Keep-Alive", "timeout=86400") // 24 hours
+	w.Header().Set("Keep-Alive", fmt.Sprintf("timeout=%d", int(config.DefaultTimeoutConfig().SSETimeout.Seconds())))
 
 	// Verify flusher support
 	flusher, ok := w.(http.Flusher)
@@ -365,20 +367,23 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 		return
 	}
 
+	// Get timeout configurations
+	timeoutConfig := config.DefaultTimeoutConfig()
+
 	// Use a custom transport with optimized settings for SSE
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout:   timeoutConfig.RequestTimeout,
+			KeepAlive: timeoutConfig.PollInterval,
 			DualStack: true,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       timeoutConfig.SSETimeout,
+		TLSHandshakeTimeout:   timeoutConfig.RequestTimeout,
+		ExpectContinueTimeout: timeoutConfig.RequestTimeout / 30, // A fraction of request timeout
+		ResponseHeaderTimeout: timeoutConfig.RequestTimeout,
 		DisableKeepAlives:     false,
 		MaxIdleConnsPerHost:   100,
 	}
@@ -386,8 +391,8 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 	// Enable TCP keep-alive
 	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		dialer := &net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout:   timeoutConfig.RequestTimeout,
+			KeepAlive: timeoutConfig.PollInterval,
 			DualStack: true,
 		}
 		conn, err := dialer.DialContext(ctx, network, addr)
@@ -396,7 +401,7 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 		}
 		if tc, ok := conn.(*net.TCPConn); ok {
 			tc.SetKeepAlive(true)
-			tc.SetKeepAlivePeriod(30 * time.Second)
+			tc.SetKeepAlivePeriod(timeoutConfig.PollInterval)
 			tc.SetNoDelay(true)
 		}
 		return conn, nil
@@ -444,7 +449,7 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 	w.WriteHeader(resp.StatusCode)
 
 	reader := bufio.NewReaderSize(resp.Body, 4096)
-	heartbeat := time.NewTicker(15 * time.Second) // More frequent heartbeat
+	heartbeat := time.NewTicker(timeoutConfig.HeartbeatInterval)
 	defer heartbeat.Stop()
 
 	// Create error channel for connection errors
@@ -469,7 +474,7 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 				default:
 					// Set a write deadline for each write operation
 					if conn, ok := w.(interface{ SetWriteDeadline(time.Time) error }); ok {
-						conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+						conn.SetWriteDeadline(time.Now().Add(timeoutConfig.WriteTimeout))
 					}
 
 					if _, writeErr := w.Write(line); writeErr != nil {
@@ -511,7 +516,7 @@ func proxySSE(w http.ResponseWriter, r *http.Request, inst *models.GatewayInstan
 			default:
 				// Set a write deadline for heartbeat
 				if conn, ok := w.(interface{ SetWriteDeadline(time.Time) error }); ok {
-					conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					conn.SetWriteDeadline(time.Now().Add(timeoutConfig.WriteTimeout))
 				}
 
 				if _, err := w.Write([]byte(": heartbeat\n\n")); err != nil {
@@ -551,7 +556,7 @@ func proxyGeneral(w http.ResponseWriter, r *http.Request, inst *models.GatewayIn
 		req.Host = inst.InternalURL.Host
 		req.URL.RawQuery = r.URL.RawQuery
 	}
-	proxy.FlushInterval = 100 * time.Millisecond
+	proxy.FlushInterval = config.DefaultTimeoutConfig().FlushInterval
 	proxy.ServeHTTP(w, r)
 }
 
@@ -578,19 +583,22 @@ func handlePost(w http.ResponseWriter, r *http.Request, inst *models.GatewayInst
 		target += "?" + r.URL.RawQuery
 	}
 
+	// Get timeout configurations
+	timeoutConfig := config.DefaultTimeoutConfig()
+
 	// Create custom client with timeouts
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: timeoutConfig.RequestTimeout,
 		Transport: &http.Transport{
 			DisableKeepAlives:     false,
-			IdleConnTimeout:       90 * time.Second,
-			ResponseHeaderTimeout: 30 * time.Second,
+			IdleConnTimeout:       timeoutConfig.SSETimeout,
+			ResponseHeaderTimeout: timeoutConfig.RequestTimeout,
 			MaxIdleConnsPerHost:   100,
 		},
 	}
 
 	// Create a new request context that doesn't affect the SSE connection
-	postCtx, postCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	postCtx, postCancel := context.WithTimeout(context.Background(), timeoutConfig.RequestTimeout)
 	defer postCancel()
 
 	req, _ := http.NewRequestWithContext(postCtx, http.MethodPost, target, bytes.NewReader(body))
