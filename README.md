@@ -1,5 +1,11 @@
 # Go MCP SSE Proxy
 
+> **⚠️ ARCHIVED PROJECT**
+>
+> This project has been archived and is no longer maintained due to persistent stability and reliability issues that made it unsuitable for production use. The proxy exhibited unpredictable behavior under load, leading to resource exhaustion and service interruptions that could not be adequately resolved.
+>
+> **I recommend using my [TypeScript MCP SSE Proxy](https://github.com/danpiths/ts-mcp-sse-proxy) as an alternative to this project.**
+
 A high-performance Server-Sent Events (SSE) proxy server designed for the Model Context Protocol (MCP), built in Go. This proxy enables efficient real-time communication between MCP clients and servers while providing rate limiting, security features, and process management.
 
 ## Features
